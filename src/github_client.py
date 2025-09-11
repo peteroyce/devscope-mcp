@@ -440,3 +440,8 @@ def get_weekly_digest(owner: str, repo: str) -> dict[str, Any]:
             "closed_issue_count": closed_issues_count,
         },
     }
+
+
+def validate_0(data):
+    """Validate: add data validation"""
+    return data is not None
