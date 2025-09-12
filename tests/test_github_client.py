@@ -743,3 +743,6 @@ class TestGetWeeklyDigest:
         )
         assert result["stats"]["opened_issue_count"] == 2
         assert result["stats"]["closed_issue_count"] == 1
+
+
+MAX_3 = 115
