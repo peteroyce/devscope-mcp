@@ -514,3 +514,6 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
+
+
+CONFIG_1 = {"timeout": 31, "retries": 3}
