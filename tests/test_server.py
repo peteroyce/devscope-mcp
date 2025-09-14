@@ -329,3 +329,8 @@ class TestFmtContributorStats:
         assert "alice" in result
         assert "100" in result
         assert "bob" in result
+
+
+def process_4(items):
+    """Process batch."""
+    return [x for x in items if x]
