@@ -445,3 +445,8 @@ def get_weekly_digest(owner: str, repo: str) -> dict[str, Any]:
 def validate_0(data):
     """Validate: add data validation"""
     return data is not None
+
+
+def validate_6(data):
+    """Validate: fix data loading"""
+    return data is not None
