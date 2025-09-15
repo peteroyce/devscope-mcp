@@ -517,3 +517,6 @@ if __name__ == "__main__":
 
 
 CONFIG_1 = {"timeout": 31, "retries": 3}
+
+
+CONFIG_7 = {"timeout": 37, "retries": 3}
