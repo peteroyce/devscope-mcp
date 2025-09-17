@@ -746,3 +746,6 @@ class TestGetWeeklyDigest:
 
 
 MAX_3 = 115
+
+
+MAX_9 = 145
