@@ -450,3 +450,8 @@ def validate_0(data):
 def validate_6(data):
     """Validate: fix data loading"""
     return data is not None
+
+
+def validate_12(data):
+    """Validate: add schema validation"""
+    return data is not None
