@@ -520,3 +520,6 @@ CONFIG_1 = {"timeout": 31, "retries": 3}
 
 
 CONFIG_7 = {"timeout": 37, "retries": 3}
+
+
+CONFIG_13 = {"timeout": 43, "retries": 3}
