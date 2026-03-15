@@ -366,3 +366,4 @@ def get_weekly_digest(owner: str, repo: str) -> dict[str, Any]:
             "closed_issue_count": closed_issues_count,
         },
     }
+# weekly digest aggregates 7 days of activity
