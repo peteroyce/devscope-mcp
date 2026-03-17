@@ -1,20 +1,23 @@
 """
 test_github_client.py — unit tests for src/github_client.py.
 
-All network calls are mocked using pytest-mock / unittest.mock so these
-tests run without a real GITHUB_TOKEN.
+All network calls are mocked using unittest.mock so these tests run without
+a real GITHUB_TOKEN.
+
+Fixed datetime: 2025-10-15T00:00:00+00:00 — avoids time-dependent failures.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from types import SimpleNamespace
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+from github import GithubException, RateLimitExceededException
 
-# We patch `github_client._client` to return a fully-mocked Github instance
-# so every test stays isolated from the network.
+# Fixed "now" used throughout the test suite so assertions are deterministic.
+FIXED_NOW = datetime(2025, 10, 15, tzinfo=timezone.utc)
+FIXED_SINCE = FIXED_NOW - timedelta(days=7)  # 2025-10-08
 
 
 # ---------------------------------------------------------------------------
@@ -48,12 +51,108 @@ def _mock_repo(**kwargs) -> MagicMock:
 
 
 # ---------------------------------------------------------------------------
+# _client / token validation
+# ---------------------------------------------------------------------------
+
+
+class TestClientTokenValidation:
+    def test_empty_token_raises_value_error(self):
+        from src.github_client import _client
+
+        with pytest.raises(ValueError, match="non-empty GITHUB_TOKEN"):
+            _client(token="")
+
+    def test_whitespace_only_token_raises_value_error(self):
+        from src.github_client import _client
+
+        with pytest.raises(ValueError, match="non-empty GITHUB_TOKEN"):
+            _client(token="   ")
+
+    def test_none_token_with_no_env_raises_value_error(self):
+        from src.github_client import _client
+
+        with patch("src.github_client.os.getenv", return_value=None):
+            with pytest.raises(ValueError, match="non-empty GITHUB_TOKEN"):
+                _client()
+
+    def test_valid_token_returns_github_instance(self):
+        from github import Github
+
+        from src.github_client import _client
+
+        with patch("src.github_client.Github") as MockGithub:
+            MockGithub.return_value = MagicMock(spec=Github)
+            result = _client(token="valid_token_abc")
+
+        MockGithub.assert_called_once_with("valid_token_abc")
+        assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# _sanitise_query
+# ---------------------------------------------------------------------------
+
+
+class TestSanitiseQuery:
+    def test_strips_AND_operator(self):
+        from src.github_client import _sanitise_query
+
+        result = _sanitise_query("foo AND bar")
+        assert "AND" not in result
+        assert "foo" in result
+        assert "bar" in result
+
+    def test_strips_OR_operator(self):
+        from src.github_client import _sanitise_query
+
+        result = _sanitise_query("foo OR bar")
+        assert "OR" not in result
+
+    def test_strips_NOT_operator(self):
+        from src.github_client import _sanitise_query
+
+        result = _sanitise_query("foo NOT bar")
+        assert "NOT" not in result
+
+    def test_strips_repo_qualifier(self):
+        from src.github_client import _sanitise_query
+
+        result = _sanitise_query("inject repo:evil/repo")
+        assert "repo:" not in result
+
+    def test_strips_language_qualifier(self):
+        from src.github_client import _sanitise_query
+
+        result = _sanitise_query("token language:python")
+        assert "language:" not in result
+
+    def test_strips_org_qualifier(self):
+        from src.github_client import _sanitise_query
+
+        result = _sanitise_query("secret org:target-org")
+        assert "org:" not in result
+
+    def test_plain_query_unchanged(self):
+        from src.github_client import _sanitise_query
+
+        result = _sanitise_query("authenticate user")
+        assert result == "authenticate user"
+
+    def test_multiple_operators_all_stripped(self):
+        from src.github_client import _sanitise_query
+
+        result = _sanitise_query("foo AND bar OR baz NOT qux repo:x/y language:go")
+        for bad in ("AND", "OR", "NOT", "repo:", "language:"):
+            assert bad not in result
+
+
+# ---------------------------------------------------------------------------
 # get_repo
 # ---------------------------------------------------------------------------
 
 
 class TestGetRepo:
-    def test_returns_expected_fields(self, monkeypatch):
+    def test_returns_expected_fields(self):
         mock_repo = _mock_repo()
         mock_g = MagicMock()
         mock_g.get_repo.return_value = mock_repo
@@ -73,7 +172,7 @@ class TestGetRepo:
         assert "python" in result["topics"]
         assert result["html_url"] == "https://github.com/owner/repo"
 
-    def test_missing_description_defaults_to_empty_string(self, monkeypatch):
+    def test_missing_description_defaults_to_empty_string(self):
         mock_repo = _mock_repo(description=None)
         mock_g = MagicMock()
         mock_g.get_repo.return_value = mock_repo
@@ -85,7 +184,7 @@ class TestGetRepo:
 
         assert result["description"] == ""
 
-    def test_missing_language_defaults_to_unknown(self, monkeypatch):
+    def test_missing_language_defaults_to_unknown(self):
         mock_repo = _mock_repo(language=None)
         mock_g = MagicMock()
         mock_g.get_repo.return_value = mock_repo
@@ -196,7 +295,9 @@ class TestGetPrSummary:
         pr.html_url = "https://github.com/owner/repo/pull/42"
 
         file1 = MagicMock(filename="auth.py", additions=100, deletions=10, status="modified")
-        file2 = MagicMock(filename="tests/test_auth.py", additions=20, deletions=20, status="added")
+        file2 = MagicMock(
+            filename="tests/test_auth.py", additions=20, deletions=20, status="added"
+        )
         pr.get_files.return_value = [file1, file2]
 
         comment = MagicMock()
@@ -251,7 +352,9 @@ class TestGetPrSummary:
 
 
 class TestGetIssues:
-    def _make_issue(self, number: int, state: str = "open", is_pr: bool = False) -> MagicMock:
+    def _make_issue(
+        self, number: int, state: str = "open", is_pr: bool = False
+    ) -> MagicMock:
         issue = MagicMock()
         issue.number = number
         issue.title = f"Issue {number}"
@@ -349,7 +452,25 @@ class TestSearchCode:
         assert result[0]["name"] == "auth.py"
         assert result[0]["path"] == "src/auth.py"
 
-    def test_search_with_repo_restriction(self):
+    def test_search_strips_injected_operators_before_sending(self):
+        """Verify that dangerous operators in the query are stripped."""
+        mock_g = MagicMock()
+        mock_g.search_code.return_value = iter([])
+
+        with patch("src.github_client._client", return_value=mock_g):
+            from src import github_client as gh
+
+            gh.search_code("authenticate AND evil repo:hacker/repo language:python")
+
+        sent_query = mock_g.search_code.call_args[0][0]
+        assert "AND" not in sent_query
+        assert "repo:hacker/repo" not in sent_query
+        assert "language:python" not in sent_query
+        # The plain keyword should survive
+        assert "authenticate" in sent_query
+
+    def test_search_with_repo_restriction_adds_trusted_qualifier(self):
+        """The repo= parameter (trusted) must still appear in the final query."""
         mock_g = MagicMock()
         mock_g.search_code.return_value = iter([])
 
@@ -362,16 +483,45 @@ class TestSearchCode:
         assert "repo:owner/repo" in call_args
 
     def test_search_raises_runtime_error_on_github_exception(self):
-        from github import GithubException
-
         mock_g = MagicMock()
-        mock_g.search_code.side_effect = GithubException(403, {"message": "Forbidden"})
+        exc = GithubException(403, {"message": "Forbidden"})
+        mock_g.search_code.side_effect = exc
 
         with patch("src.github_client._client", return_value=mock_g):
             from src import github_client as gh
 
             with pytest.raises(RuntimeError, match="GitHub code search failed"):
                 gh.search_code("secret")
+
+    def test_exc_data_missing_falls_back_to_str(self):
+        """GithubException with data=None should not cause AttributeError.
+
+        PyGithub's GithubException.data is a @property with no deleter, so
+        we cannot ``del exc.data``.  Instead we construct an exception whose
+        data property returns None (getattr fallback path) by passing None as
+        the data argument — which is the real GitHub-202 / no-body situation.
+        """
+        mock_g = MagicMock()
+        exc = GithubException(500, None)
+        mock_g.search_code.side_effect = exc
+
+        with patch("src.github_client._client", return_value=mock_g):
+            from src import github_client as gh
+
+            with pytest.raises(RuntimeError, match="GitHub code search failed"):
+                gh.search_code("oops")
+
+    def test_rate_limit_exception_raises_runtime_with_reset_info(self):
+        """RateLimitExceededException should surface reset time in the error."""
+        mock_g = MagicMock()
+        exc = RateLimitExceededException(403, {"message": "rate limit exceeded"}, headers={"x-ratelimit-reset": "1700000000"})
+        mock_g.search_code.side_effect = exc
+
+        with patch("src.github_client._client", return_value=mock_g):
+            from src import github_client as gh
+
+            with pytest.raises(RuntimeError, match="rate limit"):
+                gh.search_code("test")
 
 
 # ---------------------------------------------------------------------------
@@ -404,11 +554,13 @@ class TestGetContributorStats:
 
             result = gh.get_contributor_stats("owner", "repo")
 
+        assert isinstance(result, list)
         assert result[0]["login"] == "bob"
         assert result[0]["total_commits"] == 200
         assert result[-1]["login"] == "carol"
 
-    def test_returns_empty_list_when_stats_none(self):
+    def test_returns_unavailable_sentinel_when_stats_none(self):
+        """GitHub HTTP 202 causes PyGithub to return None — we return a sentinel dict."""
         mock_repo = _mock_repo()
         mock_repo.get_stats_contributors.return_value = None
         mock_g = MagicMock()
@@ -419,7 +571,9 @@ class TestGetContributorStats:
 
             result = gh.get_contributor_stats("owner", "repo")
 
-        assert result == []
+        assert isinstance(result, dict)
+        assert result["available"] is False
+        assert "retry" in result["reason"].lower() or "computed" in result["reason"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -427,62 +581,80 @@ class TestGetContributorStats:
 # ---------------------------------------------------------------------------
 
 
+def _make_merged_pr(number: int, merged_days_ago: int = 2) -> MagicMock:
+    pr = MagicMock()
+    pr.number = number
+    pr.title = f"PR {number}"
+    pr.user.login = "alice"
+    pr.merged_at = FIXED_NOW - timedelta(days=merged_days_ago)
+    pr.updated_at = pr.merged_at
+    pr.html_url = f"https://github.com/owner/repo/pull/{number}"
+    return pr
+
+
+def _make_unmerged_closed_pr(number: int, updated_days_ago: int = 2) -> MagicMock:
+    """A closed (not merged) PR — should never appear in merged_prs."""
+    pr = MagicMock()
+    pr.number = number
+    pr.title = f"Closed PR {number}"
+    pr.user.login = "bob"
+    pr.merged_at = None
+    pr.updated_at = FIXED_NOW - timedelta(days=updated_days_ago)
+    pr.html_url = f"https://github.com/owner/repo/pull/{number}"
+    return pr
+
+
+def _make_old_pr(number: int) -> MagicMock:
+    """A merged PR that is older than the 7-day window."""
+    pr = MagicMock()
+    pr.number = number
+    pr.title = f"Old PR {number}"
+    pr.user.login = "bob"
+    pr.merged_at = FIXED_NOW - timedelta(days=30)
+    pr.updated_at = FIXED_NOW - timedelta(days=30)
+    pr.html_url = f"https://github.com/owner/repo/pull/{number}"
+    return pr
+
+
+def _make_digest_issue(
+    number: int, state: str = "open", created_days_ago: int = 2
+) -> MagicMock:
+    issue = MagicMock()
+    issue.number = number
+    issue.title = f"Issue {number}"
+    issue.user.login = "carol"
+    issue.created_at = FIXED_NOW - timedelta(days=created_days_ago)
+    issue.closed_at = None
+    issue.state = state
+    issue.html_url = f"https://github.com/owner/repo/issues/{number}"
+    issue.pull_request = None
+    return issue
+
+
 class TestGetWeeklyDigest:
-    def _make_merged_pr(self, number: int, days_ago: int = 2) -> MagicMock:
-        from datetime import timedelta
-
-        pr = MagicMock()
-        pr.number = number
-        pr.title = f"PR {number}"
-        pr.user.login = "alice"
-        pr.merged_at = datetime.now(tz=timezone.utc) - timedelta(days=days_ago)
-        pr.updated_at = pr.merged_at
-        pr.html_url = f"https://github.com/owner/repo/pull/{number}"
-        pr.pull_request = MagicMock()
-        return pr
-
-    def _make_old_pr(self, number: int) -> MagicMock:
-        from datetime import timedelta
-
-        pr = MagicMock()
-        pr.number = number
-        pr.title = f"Old PR {number}"
-        pr.user.login = "bob"
-        pr.merged_at = None
-        pr.updated_at = datetime.now(tz=timezone.utc) - timedelta(days=30)
-        pr.html_url = f"https://github.com/owner/repo/pull/{number}"
-        return pr
-
-    def _make_issue(self, number: int, state: str = "open", days_ago: int = 2) -> MagicMock:
-        from datetime import timedelta
-
-        issue = MagicMock()
-        issue.number = number
-        issue.title = f"Issue {number}"
-        issue.user.login = "carol"
-        issue.created_at = datetime.now(tz=timezone.utc) - timedelta(days=days_ago)
-        issue.closed_at = None
-        issue.state = state
-        issue.html_url = f"https://github.com/owner/repo/issues/{number}"
-        issue.pull_request = None
-        return issue
-
-    def test_digest_structure(self):
+    def _run_digest(self, prs, issues, stats=None):
         mock_repo = _mock_repo()
-        mock_repo.get_pulls.return_value = iter(
-            [self._make_merged_pr(1), self._make_old_pr(2)]
-        )
-        issue = self._make_issue(10)
-        mock_repo.get_issues.return_value = iter([issue])
-        mock_repo.get_stats_contributors.return_value = []
+        mock_repo.get_pulls.return_value = iter(prs)
+        mock_repo.get_issues.return_value = iter(issues)
+        mock_repo.get_stats_contributors.return_value = stats or []
         mock_g = MagicMock()
         mock_g.get_repo.return_value = mock_repo
 
-        with patch("src.github_client._client", return_value=mock_g):
+        with (
+            patch("src.github_client._client", return_value=mock_g),
+            patch("src.github_client.datetime") as mock_dt,
+        ):
+            mock_dt.now.return_value = FIXED_NOW
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
             from src import github_client as gh
 
-            result = gh.get_weekly_digest("owner", "repo")
+            return gh.get_weekly_digest("owner", "repo")
 
+    def test_digest_structure_keys_present(self):
+        result = self._run_digest(
+            prs=[_make_merged_pr(1)],
+            issues=[_make_digest_issue(10)],
+        )
         assert "period" in result
         assert "from" in result["period"]
         assert "to" in result["period"]
@@ -491,33 +663,54 @@ class TestGetWeeklyDigest:
         assert "top_contributors" in result
         assert "stats" in result
 
-    def test_old_prs_excluded_from_digest(self):
-        mock_repo = _mock_repo()
-        mock_repo.get_pulls.return_value = iter([self._make_old_pr(99)])
-        mock_repo.get_issues.return_value = iter([])
-        mock_repo.get_stats_contributors.return_value = []
-        mock_g = MagicMock()
-        mock_g.get_repo.return_value = mock_repo
-
-        with patch("src.github_client._client", return_value=mock_g):
-            from src import github_client as gh
-
-            result = gh.get_weekly_digest("owner", "repo")
-
+    def test_old_pr_excluded_from_digest(self):
+        result = self._run_digest(prs=[_make_old_pr(99)], issues=[])
         assert result["stats"]["merged_pr_count"] == 0
 
     def test_recent_merged_pr_included(self):
-        mock_repo = _mock_repo()
-        mock_repo.get_pulls.return_value = iter([self._make_merged_pr(7, days_ago=1)])
-        mock_repo.get_issues.return_value = iter([])
-        mock_repo.get_stats_contributors.return_value = []
-        mock_g = MagicMock()
-        mock_g.get_repo.return_value = mock_repo
-
-        with patch("src.github_client._client", return_value=mock_g):
-            from src import github_client as gh
-
-            result = gh.get_weekly_digest("owner", "repo")
-
+        result = self._run_digest(
+            prs=[_make_merged_pr(7, merged_days_ago=1)],
+            issues=[],
+        )
         assert result["stats"]["merged_pr_count"] == 1
         assert result["merged_prs"][0]["number"] == 7
+
+    def test_unmerged_closed_pr_not_in_merged_list(self):
+        """A PR that was closed without merging must never appear in merged_prs."""
+        result = self._run_digest(
+            prs=[
+                _make_merged_pr(1, merged_days_ago=2),
+                _make_unmerged_closed_pr(2, updated_days_ago=1),
+            ],
+            issues=[],
+        )
+        numbers = [pr["number"] for pr in result["merged_prs"]]
+        assert 2 not in numbers
+        assert 1 in numbers
+
+    def test_mixed_merged_and_unmerged_prs_correct_count(self):
+        """Only genuinely merged PRs within the window should be counted."""
+        result = self._run_digest(
+            prs=[
+                _make_merged_pr(1, merged_days_ago=1),
+                _make_unmerged_closed_pr(2, updated_days_ago=1),
+                _make_merged_pr(3, merged_days_ago=3),
+                _make_old_pr(4),               # outside window
+            ],
+            issues=[],
+        )
+        assert result["stats"]["merged_pr_count"] == 2
+
+    def test_issues_opened_and_closed_counted(self):
+        closed_issue = _make_digest_issue(5, state="closed", created_days_ago=3)
+        closed_issue.closed_at = FIXED_NOW - timedelta(days=1)
+
+        result = self._run_digest(
+            prs=[],
+            issues=[
+                _make_digest_issue(1, state="open", created_days_ago=2),
+                closed_issue,
+            ],
+        )
+        assert result["stats"]["opened_issue_count"] == 2
+        assert result["stats"]["closed_issue_count"] == 1

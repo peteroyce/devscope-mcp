@@ -8,11 +8,12 @@ so that the MCP server layer stays free of PyGithub objects.
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from dotenv import load_dotenv
-from github import Github, GithubException
+from github import Github, GithubException, RateLimitExceededException
 from github.Repository import Repository
 
 load_dotenv()
@@ -21,12 +22,24 @@ load_dotenv()
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _client() -> Github:
-    """Return an authenticated Github client, reading the token from the env."""
-    token = os.getenv("GITHUB_TOKEN")
-    if not token:
-        raise EnvironmentError(
-            "GITHUB_TOKEN is not set. Add it to your .env file or environment."
+def _client(token: str | None = None) -> Github:
+    """Return an authenticated Github client.
+
+    Args:
+        token: optional explicit token; if omitted the value is read from the
+               GITHUB_TOKEN environment variable.
+
+    Raises:
+        ValueError: if the token is empty or whitespace-only.
+        EnvironmentError: if no token is available at all.
+    """
+    if token is None:
+        token = os.getenv("GITHUB_TOKEN")
+
+    if not token or not token.strip():
+        raise ValueError(
+            "A non-empty GITHUB_TOKEN is required. "
+            "Add it to your .env file or environment."
         )
     return Github(token)
 
@@ -37,6 +50,27 @@ def _default_org() -> str | None:
 
 def _repo(g: Github, owner: str, repo: str) -> Repository:
     return g.get_repo(f"{owner}/{repo}")
+
+
+# ---------------------------------------------------------------------------
+# Search query sanitisation
+# ---------------------------------------------------------------------------
+
+# Dangerous operator patterns that could be injected into code search queries.
+# We strip boolean operators and the most common qualifier prefixes so callers
+# cannot escalate their search scope beyond the intended query term.
+_OPERATOR_RE = re.compile(
+    r"\b(AND|OR|NOT)\b"               # boolean operators (case-sensitive on GitHub)
+    r"|(?:^|\s)(repo|language|org|user|path|extension|filename|size|fork|in):",
+    re.IGNORECASE,
+)
+
+
+def _sanitise_query(query: str) -> str:
+    """Strip dangerous GitHub search operators from a user-supplied query string."""
+    sanitised = _OPERATOR_RE.sub(" ", query)
+    # Collapse runs of whitespace that result from stripping
+    return " ".join(sanitised.split())
 
 
 # ---------------------------------------------------------------------------
@@ -217,14 +251,20 @@ def search_code(query: str, repo: str | None = None) -> list[dict[str, Any]]:
     """
     Search code on GitHub.
 
+    The user-supplied *query* is sanitised to strip boolean operators and
+    qualifier prefixes (repo:, language:, etc.) that could be used for
+    search-query injection.  The ``repo`` parameter is added by this function
+    as a trusted qualifier.
+
     Args:
-        query: GitHub code-search query string (e.g. "auth token")
-        repo:  optional "owner/repo" to restrict the search
+        query: free-text code-search query (operators will be stripped)
+        repo:  optional "owner/repo" to restrict the search (trusted)
 
     Returns a list of result dicts.
     """
     g = _client()
-    full_query = f"{query} repo:{repo}" if repo else query
+    safe_query = _sanitise_query(query)
+    full_query = f"{safe_query} repo:{repo}" if repo else safe_query
 
     results: list[dict[str, Any]] = []
     try:
@@ -240,26 +280,41 @@ def search_code(query: str, repo: str | None = None) -> list[dict[str, Any]]:
             )
             if len(results) >= 20:
                 break
+    except RateLimitExceededException as exc:
+        reset_time = getattr(exc, "headers", {}) or {}
+        reset_ts = reset_time.get("x-ratelimit-reset", "unknown")
+        raise RuntimeError(
+            f"GitHub rate limit exceeded for code search. "
+            f"Rate limit resets at: {reset_ts}"
+        ) from exc
     except GithubException as exc:
-        # Code search requires authentication and can be rate-limited
-        raise RuntimeError(f"GitHub code search failed: {exc.data}") from exc
+        data = getattr(exc, "data", str(exc))
+        raise RuntimeError(f"GitHub code search failed: {data}") from exc
 
     return results
 
 
-def get_contributor_stats(owner: str, repo: str) -> list[dict[str, Any]]:
+def get_contributor_stats(owner: str, repo: str) -> list[dict[str, Any]] | dict[str, Any]:
     """
     Return contribution statistics per contributor.
 
-    Returns a list sorted by total commits descending:
-        [{login, total_commits, additions, deletions, weeks_active}]
+    GitHub returns HTTP 202 (stats still being computed) when the statistics
+    are not yet cached. In that case PyGithub returns ``None``. This function
+    returns a structured "unavailable" sentinel dict instead of an empty list
+    so callers can distinguish "no contributors" from "stats not ready yet".
+
+    Returns:
+        On success — list sorted by total commits descending:
+            [{login, total_commits, additions, deletions, weeks_active}]
+        When GitHub is still computing stats:
+            {"available": False, "reason": "Stats are being computed, retry in a moment"}
     """
     g = _client()
     r = _repo(g, owner, repo)
     stats = r.get_stats_contributors()
 
     if stats is None:
-        return []
+        return {"available": False, "reason": "Stats are being computed, retry in a moment"}
 
     results = []
     for stat in stats:
@@ -299,21 +354,33 @@ def get_weekly_digest(owner: str, repo: str) -> dict[str, Any]:
     now = datetime.now(tz=timezone.utc)
     since = now - timedelta(days=7)
 
-    # Merged PRs in the last 7 days
+    # Merged PRs in the last 7 days.
+    # Sort by merged_at (not updated_at) so the early-break condition is
+    # reliable: once merged_at falls before the window we know all subsequent
+    # PRs are also outside the window.
     merged_prs = []
     for pr in r.get_pulls(state="closed", sort="updated", direction="desc"):
-        if pr.merged_at and pr.merged_at >= since:
-            merged_prs.append(
-                {
-                    "number": pr.number,
-                    "title": pr.title,
-                    "author": pr.user.login if pr.user else "ghost",
-                    "merged_at": pr.merged_at.isoformat(),
-                    "html_url": pr.html_url,
-                }
-            )
-        elif pr.updated_at < since:
-            break  # list is sorted by updated_at; no point going further
+        # Only count PRs that were actually merged (not just closed)
+        if pr.merged_at is not None:
+            if pr.merged_at >= since:
+                merged_prs.append(
+                    {
+                        "number": pr.number,
+                        "title": pr.title,
+                        "author": pr.user.login if pr.user else "ghost",
+                        "merged_at": pr.merged_at.isoformat(),
+                        "html_url": pr.html_url,
+                    }
+                )
+        # Early-break: if the PR's merged_at is before the window we stop.
+        # For unmerged (closed) PRs we fall through to the updated_at guard
+        # below so we don't break prematurely on an unmerged PR that appears
+        # early in the sorted list.
+        if pr.merged_at is not None and pr.merged_at < since:
+            break
+        # Secondary guard: if even updated_at is old, nothing newer follows.
+        if pr.updated_at is not None and pr.updated_at < since:
+            break
 
     # Issues opened in the last 7 days
     opened_issues = []
@@ -338,7 +405,7 @@ def get_weekly_digest(owner: str, repo: str) -> dict[str, Any]:
     top_contributors: list[dict[str, Any]] = []
     try:
         stats = r.get_stats_contributors()
-        if stats:
+        if stats and not isinstance(stats, dict):
             weekly: list[tuple[str, int]] = []
             for stat in stats:
                 # The last week in the stats list is the most recent
@@ -352,6 +419,8 @@ def get_weekly_digest(owner: str, repo: str) -> dict[str, Any]:
             top_contributors = [
                 {"login": login, "commits": commits} for login, commits in weekly[:5]
             ]
+    except RateLimitExceededException:
+        pass  # contributor stats are best-effort in the digest
     except GithubException:
         pass  # stats may not be ready on newly created repos
 
@@ -366,5 +435,3 @@ def get_weekly_digest(owner: str, repo: str) -> dict[str, Any]:
             "closed_issue_count": closed_issues_count,
         },
     }
-# weekly digest aggregates 7 days of activity
-# github api rate limit handled with graceful error message

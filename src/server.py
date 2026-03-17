@@ -319,7 +319,12 @@ def _fmt_search_code(results: list[dict[str, Any]]) -> str:
     return "\n\n".join(lines)
 
 
-def _fmt_contributor_stats(stats: list[dict[str, Any]]) -> str:
+def _fmt_contributor_stats(stats: list[dict[str, Any]] | dict[str, Any]) -> str:
+    # Handle the "stats not yet available" sentinel returned when GitHub
+    # returns HTTP 202 (stats still being computed).
+    if isinstance(stats, dict):
+        reason = stats.get("reason", "Stats are unavailable.")
+        return f"Contributor stats are not yet available: {reason}"
     if not stats:
         return "No contributor stats available (the repository may be empty or stats are still being computed by GitHub)."
     lines = ["Contributor Statistics (sorted by total commits):\n"]
@@ -333,14 +338,14 @@ def _fmt_contributor_stats(stats: list[dict[str, Any]]) -> str:
 
 
 def _fmt_weekly_digest(digest: dict[str, Any]) -> str:
-    p = digest["period"]
+    period = digest["period"]
     s = digest["stats"]
 
-    # Merged PRs
+    # Merged PRs — note: iterate over digest["merged_prs"], not period
     if digest["merged_prs"]:
         pr_lines = [
-            f"  • #{p['number']}  {p['title']}  by {p['author']}  ({p['merged_at']})\n    {p['html_url']}"
-            for p in digest["merged_prs"]
+            f"  • #{pr['number']}  {pr['title']}  by {pr['author']}  ({pr['merged_at']})\n    {pr['html_url']}"
+            for pr in digest["merged_prs"]
         ]
         prs_section = "Merged PRs:\n" + "\n".join(pr_lines)
     else:
@@ -366,7 +371,7 @@ def _fmt_weekly_digest(digest: dict[str, Any]) -> str:
         contrib_section = "Top Contributors: no commit activity this week"
 
     return (
-        f"Weekly Digest — {p['from'][:10]} to {p['to'][:10]}\n"
+        f"Weekly Digest — {period['from'][:10]} to {period['to'][:10]}\n"
         f"{'=' * 55}\n"
         f"Summary: {s['merged_pr_count']} PR(s) merged | "
         f"{s['opened_issue_count']} issue(s) opened | "
@@ -378,8 +383,89 @@ def _fmt_weekly_digest(digest: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool call dispatcher
+# Tool call dispatcher (dict-based, with input validation)
 # ---------------------------------------------------------------------------
+
+def _safe_int(value: Any, field_name: str) -> int:
+    """Convert *value* to int, returning a descriptive error string on failure.
+
+    Raises:
+        ValueError: with a human-readable message if conversion fails.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid value for '{field_name}': expected an integer, got {value!r}"
+        ) from exc
+
+
+def _handle_list_repos(args: dict[str, Any]) -> str:
+    limit = _safe_int(args.get("limit", 20), "limit")
+    data = gh.list_repos(org=args.get("org"), limit=limit)
+    return _fmt_list_repos(data)
+
+
+def _handle_get_repo_info(args: dict[str, Any]) -> str:
+    data = gh.get_repo(owner=args["owner"], repo=args["repo"])
+    return _fmt_repo_info(data)
+
+
+def _handle_summarize_pr(args: dict[str, Any]) -> str:
+    pr_number = _safe_int(args["pr_number"], "pr_number")
+    data = gh.get_pr_summary(
+        owner=args["owner"],
+        repo=args["repo"],
+        pr_number=pr_number,
+    )
+    return _fmt_pr_summary(data)
+
+
+def _handle_list_issues(args: dict[str, Any]) -> str:
+    limit = _safe_int(args.get("limit", 10), "limit")
+    data = gh.get_issues(
+        owner=args["owner"],
+        repo=args["repo"],
+        state=args.get("state", "open"),
+        limit=limit,
+    )
+    return _fmt_issues(data)
+
+
+def _handle_search_code(args: dict[str, Any]) -> str:
+    data = gh.search_code(query=args["query"], repo=args.get("repo"))
+    return _fmt_search_code(data)
+
+
+def _handle_get_contributor_stats(args: dict[str, Any]) -> str:
+    data = gh.get_contributor_stats(owner=args["owner"], repo=args["repo"])
+    return _fmt_contributor_stats(data)
+
+
+def _handle_get_weekly_digest(args: dict[str, Any]) -> str:
+    data = gh.get_weekly_digest(owner=args["owner"], repo=args["repo"])
+    return _fmt_weekly_digest(data)
+
+
+# Registry mapping tool name → handler function
+_TOOL_HANDLERS: dict[str, Any] = {
+    "list_repos": _handle_list_repos,
+    "get_repo_info": _handle_get_repo_info,
+    "summarize_pr": _handle_summarize_pr,
+    "list_issues": _handle_list_issues,
+    "search_code": _handle_search_code,
+    "get_contributor_stats": _handle_get_contributor_stats,
+    "get_weekly_digest": _handle_get_weekly_digest,
+}
+
+
+def _dispatch(name: str, args: dict[str, Any]) -> str:
+    """Synchronous dispatcher — called inside an executor."""
+    handler = _TOOL_HANDLERS.get(name)
+    if handler is None:
+        known = ", ".join(sorted(_TOOL_HANDLERS))
+        raise ValueError(f"Unknown tool: '{name}'. Known tools: {known}")
+    return handler(args)
 
 
 @server.call_tool()
@@ -391,6 +477,9 @@ async def handle_call_tool(
             None, _dispatch, name, arguments
         )
         return [types.TextContent(type="text", text=result)]
+    except ValueError as exc:
+        # Covers unknown tool names and bad integer arguments
+        error_text = f"Invalid request: {exc}"
     except EnvironmentError as exc:
         error_text = f"Configuration error: {exc}"
     except RuntimeError as exc:
@@ -399,54 +488,6 @@ async def handle_call_tool(
         error_text = f"Unexpected error:\n{traceback.format_exc()}"
 
     return [types.TextContent(type="text", text=error_text)]
-
-
-def _dispatch(name: str, args: dict[str, Any]) -> str:
-    """Synchronous dispatcher — called inside an executor."""
-    if name == "list_repos":
-        data = gh.list_repos(
-            org=args.get("org"),
-            limit=int(args.get("limit", 20)),
-        )
-        return _fmt_list_repos(data)
-
-    if name == "get_repo_info":
-        data = gh.get_repo(owner=args["owner"], repo=args["repo"])
-        return _fmt_repo_info(data)
-
-    if name == "summarize_pr":
-        data = gh.get_pr_summary(
-            owner=args["owner"],
-            repo=args["repo"],
-            pr_number=int(args["pr_number"]),
-        )
-        return _fmt_pr_summary(data)
-
-    if name == "list_issues":
-        data = gh.get_issues(
-            owner=args["owner"],
-            repo=args["repo"],
-            state=args.get("state", "open"),
-            limit=int(args.get("limit", 10)),
-        )
-        return _fmt_issues(data)
-
-    if name == "search_code":
-        data = gh.search_code(
-            query=args["query"],
-            repo=args.get("repo"),
-        )
-        return _fmt_search_code(data)
-
-    if name == "get_contributor_stats":
-        data = gh.get_contributor_stats(owner=args["owner"], repo=args["repo"])
-        return _fmt_contributor_stats(data)
-
-    if name == "get_weekly_digest":
-        data = gh.get_weekly_digest(owner=args["owner"], repo=args["repo"])
-        return _fmt_weekly_digest(data)
-
-    return f"Unknown tool: {name}"
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +511,3 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
-# pr_summary tool registered
-# list_issues and search_code tools added
-# contributor_stats tool added
