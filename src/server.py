@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import traceback
 from typing import Any
 
@@ -461,6 +462,7 @@ _TOOL_HANDLERS: dict[str, Any] = {
 
 def _dispatch(name: str, args: dict[str, Any]) -> str:
     """Synchronous dispatcher — called inside an executor."""
+    logging.info(f"Tool called: {name}")
     handler = _TOOL_HANDLERS.get(name)
     if handler is None:
         known = ", ".join(sorted(_TOOL_HANDLERS))
@@ -484,8 +486,9 @@ async def handle_call_tool(
         error_text = f"Configuration error: {exc}"
     except RuntimeError as exc:
         error_text = f"GitHub API error: {exc}"
-    except Exception:
-        error_text = f"Unexpected error:\n{traceback.format_exc()}"
+    except Exception as exc:
+        logging.exception("Unexpected error in tool dispatch")
+        error_text = f"Error: {type(exc).__name__}: {exc}"
 
     return [types.TextContent(type="text", text=error_text)]
 
