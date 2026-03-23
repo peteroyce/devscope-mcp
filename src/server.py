@@ -471,3 +471,4 @@ def run() -> None:
 if __name__ == "__main__":
     run()
 # pr_summary tool registered
+# list_issues and search_code tools added
