@@ -367,3 +367,4 @@ def get_weekly_digest(owner: str, repo: str) -> dict[str, Any]:
         },
     }
 # weekly digest aggregates 7 days of activity
+# github api rate limit handled with graceful error message
