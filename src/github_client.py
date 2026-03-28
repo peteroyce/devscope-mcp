@@ -45,7 +45,7 @@ def _client(token: str | None = None) -> Github:
 
 
 def _default_org() -> str | None:
-    return os.getenv("GITHUB_DEFAULT_ORG") or None
+    return os.getenv("GITHUB_DEFAULT_ORG")
 
 
 def _repo(g: Github, owner: str, repo: str) -> Repository:
@@ -262,6 +262,11 @@ def search_code(query: str, repo: str | None = None) -> list[dict[str, Any]]:
 
     Returns a list of result dicts.
     """
+    if repo is not None:
+        _REPO_RE = re.compile(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
+        if not _REPO_RE.match(repo):
+            raise ValueError("Invalid repo format: must be owner/repo")
+
     g = _client()
     safe_query = _sanitise_query(query)
     full_query = f"{safe_query} repo:{repo}" if repo else safe_query
@@ -420,9 +425,9 @@ def get_weekly_digest(owner: str, repo: str) -> dict[str, Any]:
                 {"login": login, "commits": commits} for login, commits in weekly[:5]
             ]
     except RateLimitExceededException:
-        pass  # contributor stats are best-effort in the digest
+        top_contributors = {"available": False, "reason": "stats_unavailable"}
     except GithubException:
-        pass  # stats may not be ready on newly created repos
+        top_contributors = {"available": False, "reason": "stats_unavailable"}
 
     return {
         "period": {"from": since.isoformat(), "to": now.isoformat()},

@@ -523,6 +523,35 @@ class TestSearchCode:
             with pytest.raises(RuntimeError, match="rate limit"):
                 gh.search_code("test")
 
+    def test_repo_param_injection_raises_value_error(self):
+        """A repo value containing injection payload must raise ValueError, not reach GitHub."""
+        mock_g = MagicMock()
+        mock_g.search_code.return_value = iter([])
+
+        with patch("src.github_client._client", return_value=mock_g):
+            from src import github_client as gh
+
+            with pytest.raises(ValueError, match="Invalid repo format"):
+                gh.search_code("foo", repo="owner/repo repo:evil/bad")
+
+        # The malicious string must never have been forwarded to the GitHub API
+        mock_g.search_code.assert_not_called()
+
+    def test_valid_repo_param_accepted(self):
+        """A well-formed owner/repo string must pass validation without error."""
+        mock_g = MagicMock()
+        mock_g.search_code.return_value = iter([])
+
+        with patch("src.github_client._client", return_value=mock_g):
+            from src import github_client as gh
+
+            # Should not raise
+            gh.search_code("foo", repo="valid-owner/valid.repo_name")
+
+        mock_g.search_code.assert_called_once()
+        sent_query = mock_g.search_code.call_args[0][0]
+        assert "repo:valid-owner/valid.repo_name" in sent_query
+
 
 # ---------------------------------------------------------------------------
 # get_contributor_stats
